@@ -1,0 +1,25 @@
+---
+- name: Harden and install agents
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update system packages
+      apt:
+        upgrade: dist
+        update_cache: yes
+
+    - name: Remove unnecessary packages
+      apt:
+        name: [telnet, ftp, rsh-client]
+        state: absent
+
+    - name: Install security agents
+      include_role:
+        name: "{{ item }}"
+      loop:
+        - crowdstrike
+        - datadog
+        - splunk
+        - guardicore
+        - servicenow
+        - tenable
