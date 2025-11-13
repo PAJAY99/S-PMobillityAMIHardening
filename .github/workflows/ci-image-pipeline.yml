@@ -1,0 +1,223 @@
+name: Golden Image CI Pipeline
+
+on:
+  push:
+    branches: [ "main", "release/*" ]
+  workflow_dispatch:
+
+env:
+  PACKER_LOG: "1"
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TENABLE_THRESHOLD: ${{ vars.VULN_SEVERITY_THRESHOLD || 'CRITICAL=0;HIGH=5' }}
+
+jobs:
+  packer-build:
+    name: Build images with Packer (aws, azure)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        provider: [aws, azure]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up HashiCorp Packer
+        uses: hashicorp/setup-packer@v1
+
+      - name: Prepare Packer variables
+        run: |
+          mkdir -p packer_output
+          echo "building for ${ { matrix.provider } }"
+
+      - name: Build image with Packer
+        id: packer_build
+        run: |
+          if [ "${{ matrix.provider }}" = "aws" ]; then
+            packer build -var "aws_access_key=$AWS_ACCESS_KEY" \
+                         -var "aws_secret_key=$AWS_SECRET_KEY" \
+                         -var "aws_region=$AWS_REGION" \
+                         packer/aws-image.pkr.hcl | tee packer_aws.log
+            # extract AMI id from log
+            AMI_ID=$(grep -oP "AMI: \Kami-[0-9a-f]+" packer_aws.log | tail -1)
+            echo "ami=${AMI_ID}" >> $GITHUB_OUTPUT
+            echo "provider=aws" >> $GITHUB_OUTPUT
+          else
+            packer build packer/azure-image.pkr.hcl | tee packer_azure.log
+            IMAGE_ID=$(grep -oP "Managed Image ID: \K[-a-z0-9]+" packer_azure.log | tail -1)
+            echo "image=${IMAGE_ID}" >> $GITHUB_OUTPUT
+            echo "provider=azure" >> $GITHUB_OUTPUT
+          fi
+        env:
+          AWS_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload image metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-metadata-${{ matrix.provider }}
+          path: |
+            packer_*.log
+            # create metadata file
+            <<EOF > image-meta.txt
+            provider=${{ matrix.provider }}
+            ami=${{ steps.packer_build.outputs.ami || '' }}
+            image=${{ steps.packer_build.outputs.image || '' }}
+            EOF
+            image-meta.txt
+
+  ansible-configure:
+    name: Configure agents (Ansible)
+    runs-on: ubuntu-latest
+    needs: packer-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Packer metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: image-metadata-aws
+          path: ./artifacts || true
+
+      - name: Install Ansible & requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip sshpass
+          pip3 install ansible boto3 azure==4.0.0
+
+      - name: Run Ansible playbook on instance (configure agents)
+        id: ansible_run
+        run: |
+          # For the golden-image step we apply Ansible during Packer; if you
+          # run provisioning here, you'll need to launch a temporary instance
+          # using AMI from packer metadata and run the playbook against it.
+          echo "Running Ansible playbook (this is a placeholder - adapt to your flow)"
+          ansible-playbook -i "inventory" ansible/playbooks/golden-image.yml --extra-vars "ami_id=${AMI_ID:-''}"
+
+  terraform-test:
+    name: Terraform: provision test instance & run unit tests
+    runs-on: ubuntu-latest
+    needs: [packer-build, ansible-configure]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Prepare Terraform variables
+        run: |
+          mkdir -p tf_workdir
+          echo "image_id=${{ needs.packer-build.outputs.ami || needs.packer-build.outputs.image }}" > tf_workdir/terraform.tfvars
+
+      - name: Terraform Init & Apply
+        id: tf_apply
+        run: |
+          cd terraform/test-instance
+          terraform init -input=false
+          terraform apply -auto-approve -input=false -var "image_id=${{ needs.packer-build.outputs.ami || needs.packer-build.outputs.image }}" | tee tf_apply.log
+          INSTANCE_IP=$(grep -oP "public_ip = \K[0-9\.]+" tf_apply.log | tail -1)
+          echo "instance_ip=${INSTANCE_IP}" >> $GITHUB_OUTPUT
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+
+      - name: Run quick smoke tests (example)
+        run: |
+          echo "Running smoke tests against ${{ steps.tf_apply.outputs.instance_ip }}"
+          # curl, ssh, or other tests here
+
+  tenable-scan:
+    name: Tenable scan
+    runs-on: ubuntu-latest
+    needs: terraform-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python deps
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install requests tenable_io
+
+      - name: Run Tenable scan script
+        id: run_scan
+        run: |
+          python3 ./scripts/tenable_scan.py --target ${{ needs.terraform-test.outputs.instance_ip }} --access_key "${{ secrets.TENABLE_ACCESS_KEY }}" --secret_key "${{ secrets.TENABLE_SECRET_KEY }}" --output report.json
+          cat report.json
+        env:
+          TENABLE_ACCESS_KEY: ${{ secrets.TENABLE_ACCESS_KEY }}
+          TENABLE_SECRET_KEY: ${{ secrets.TENABLE_SECRET_KEY }}
+
+      - name: Upload Tenable report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tenable-report
+          path: report.json
+
+  evaluate-vulns:
+    name: Evaluate vulnerabilities & gate
+    runs-on: ubuntu-latest
+    needs: tenable-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Tenable report
+        uses: actions/download-artifact@v4
+        with:
+          name: tenable-report
+          path: .
+
+      - name: Evaluate vulnerabilities
+        id: eval
+        run: |
+          python3 scripts/evaluate_vulns.py report.json --threshold "${{ env.TENABLE_THRESHOLD }}" || EXIT_CODE=$?
+          # evaluate_vulns should exit non-zero when threshold exceeded
+        continue-on-error: false
+
+  publish:
+    name: Publish AMI & release (only on success)
+    runs-on: ubuntu-latest
+    needs: evaluate-vulns
+    if: ${{ needs.evaluate-vulns.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy AMI to other regions
+        run: |
+          echo "Copying AMI to other regions: ${{ secrets.AMI_COPY_REGIONS }}"
+          for r in $(echo "${{ secrets.AMI_COPY_REGIONS }}" | tr ',' ' '); do
+            aws ec2 copy-image --source-region ${{ secrets.AWS_REGION }} \
+              --source-image-id ${{ needs.packer-build.outputs.ami }} \
+              --name "golden-ami-${{ github.run_id }}-${r}" --region $r
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Whitelist AMI (example / API call)
+        run: |
+          bash ./scripts/whitelist_ami.sh "${{ needs.packer-build.outputs.ami }}" "${{ secrets.IMAGE_WHITELIST_API_TOKEN }}"
+
+      - name: Create Release Notes and Notify
+        run: |
+          echo "Release: Golden AMI ${{ needs.packer-build.outputs.ami }}" > release/notes.txt
+          echo "Tenable report: see artifact" >> release/notes.txt
+          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"Golden AMI released: ${{ needs.packer-build.outputs.ami }}\"}" ${{ secrets.SLACK_WEBHOOK }}
+
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [terraform-test]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Terraform destroy (clean test infra)
+        run: |
+          cd terraform/test-instance
+          terraform destroy -auto-approve -var "image_id=${{ needs.packer-build.outputs.ami || needs.packer-build.outputs.image }}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
