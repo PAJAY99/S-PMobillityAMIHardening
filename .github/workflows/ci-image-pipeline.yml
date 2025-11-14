@@ -1,7 +1,7 @@
 name: Golden Image CI Pipeline
 
-on:
-  push:
+on
+  push
     branches: [ "main", "release/*" ]
   workflow_dispatch:
 
